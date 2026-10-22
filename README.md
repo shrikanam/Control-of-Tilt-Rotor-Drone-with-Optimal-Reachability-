@@ -1,4 +1,3 @@
-# Control-of-Tilt-Rotor-Drone-with-Optimal-Reachability-
 # Control of Tilt-Rotor Drones Using Optimal Reachability
 
 Research project investigating reachability-based control methods for tilt-rotor drones with independently actuated motor orientations.
