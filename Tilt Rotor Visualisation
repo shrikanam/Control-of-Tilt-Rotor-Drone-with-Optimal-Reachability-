@@ -1,0 +1,411 @@
+
+import numpy as np
+import sympy as sym
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+ 
+ 
+# ============================================================
+# PHYSICAL PARAMETERS
+# ============================================================
+ 
+params = {
+    "m":   1.0,        # Mass [kg]
+    "g":   9.81,       # Gravity [m/s^2]
+    "L":   0.25,       # Center-to-rotor distance [m]
+    "k_f": 3e-6,       # Thrust coefficient: F = k_f * w   (w = signed-square speed = omega^2)
+    "k_m": 0,       # Drag-torque coefficient: M = k_m * w
+    "J_x": 8.1e-3,     # Inertia [kg*m^2]
+    "J_y": 8.1e-3,
+    "J_z": 14.2e-3,
+}
+ 
+# Rotor spin direction, applied to the reaction (drag) torque only.
+#   [-1, +1, -1, +1] -> alternating CW/CCW, same pattern as the fixed-rotor script
+#   [+1, +1, +1, +1] -> exactly your original equations (all reaction torques add up)
+SPIN_DIR = [-1, 1, -1, 1]
+ 
+ 
+# ============================================================
+# SYMBOLIC MODEL (your equations)
+# ============================================================
+ 
+# position [m]
+p_x, p_y, p_z = sym.symbols('p_x p_y p_z')
+# yaw, pitch, roll [rad]
+psi, theta, phi = sym.symbols('psi theta phi')
+# body-frame linear velocity [m/s]
+v_x, v_y, v_z = sym.symbols('v_x v_y v_z')
+# body-frame angular velocity [rad/s]
+w_x, w_y, w_z = sym.symbols('w_x w_y w_z')
+# rotor tilt angles [rad]
+alpha_1, alpha_2, alpha_3, alpha_4 = sym.symbols('alpha_1 alpha_2 alpha_3 alpha_4')
+# signed-square rotor speeds
+w_1, w_2, w_3, w_4 = sym.symbols('w_1 w_2 w_3 w_4')
+# tilt angular velocities [rad/s]
+w_alpha_1, w_alpha_2, w_alpha_3, w_alpha_4 = sym.symbols('w_alpha_1 w_alpha_2 w_alpha_3 w_alpha_4')
+ 
+m, J_x, J_y, J_z, g, k_f, k_m, L = sym.symbols('m J_x J_y J_z g k_f k_m L')
+ 
+v_inB_ofWB = sym.Matrix([v_x, v_y, v_z])
+w_inB_ofWB = sym.Matrix([w_x, w_y, w_z])
+J_inB = sym.diag(J_x, J_y, J_z)
+ 
+Rz = sym.Matrix([[sym.cos(psi), -sym.sin(psi), 0],
+                 [sym.sin(psi),  sym.cos(psi), 0],
+                 [0, 0, 1]])
+Ry = sym.Matrix([[sym.cos(theta), 0, sym.sin(theta)],
+                 [0, 1, 0],
+                 [-sym.sin(theta), 0, sym.cos(theta)]])
+Rx = sym.Matrix([[1, 0, 0],
+                 [0, sym.cos(phi), -sym.sin(phi)],
+                 [0, sym.sin(phi),  sym.cos(phi)]])
+ 
+R_inW_ofB = Rz @ Ry @ Rx
+ 
+# Propeller frame -> body frame
+R_B_P1 = sym.Matrix([[1, 0, 0],
+                     [0, sym.cos(alpha_1), -sym.sin(alpha_1)],
+                     [0, sym.sin(alpha_1),  sym.cos(alpha_1)]])
+ 
+R_B_P2 = sym.Matrix([[0, -sym.cos(alpha_2), sym.sin(alpha_2)],
+                     [1, 0, 0],
+                     [0, sym.sin(alpha_2), sym.cos(alpha_2)]])
+ 
+R_B_P3 = sym.Matrix([[-1, 0, 0],
+                     [0, -sym.cos(alpha_3), sym.sin(alpha_3)],
+                     [0, sym.sin(alpha_3), sym.cos(alpha_3)]])
+ 
+R_B_P4 = sym.Matrix([[0, sym.cos(alpha_4), -sym.sin(alpha_4)],
+                     [-1, 0, 0],
+                     [0, sym.sin(alpha_4), sym.cos(alpha_4)]])
+ 
+ 
+def Rz_angle(angle):
+    return sym.Matrix([[sym.cos(angle), -sym.sin(angle), 0],
+                       [sym.sin(angle),  sym.cos(angle), 0],
+                       [0, 0, 1]])
+ 
+ 
+# Rotor positions in body frame
+O_P1 = sym.simplify(Rz_angle(0)          @ sym.Matrix([L, 0, 0]))
+O_P2 = sym.simplify(Rz_angle(sym.pi/2)   @ sym.Matrix([L, 0, 0]))
+O_P3 = sym.simplify(Rz_angle(sym.pi)     @ sym.Matrix([L, 0, 0]))
+O_P4 = sym.simplify(Rz_angle(3*sym.pi/2) @ sym.Matrix([L, 0, 0]))
+ 
+# Euler-rate kinematics: [psi_dot, theta_dot, phi_dot] = N @ omega_body
+Ninv = sym.Matrix.hstack((Ry @ Rx).T @ sym.Matrix([0, 0, 1]),
+                         Rx.T @ sym.Matrix([0, 1, 0]),
+                         sym.Matrix([1, 0, 0]))
+N = sym.simplify(Ninv.inv())
+ 
+# Rotor thrust force mapping
+F_alpha = sym.Matrix([
+    [0,  k_f * sym.sin(alpha_2), 0, -k_f * sym.sin(alpha_4)],
+    [-k_f * sym.sin(alpha_1), 0, k_f * sym.sin(alpha_3), 0],
+    [k_f * sym.cos(alpha_1), k_f * sym.cos(alpha_2),
+     k_f * sym.cos(alpha_3), k_f * sym.cos(alpha_4)]
+])
+w_rotors = sym.Matrix([w_1, w_2, w_3, w_4])
+F_rotors_inB = F_alpha @ w_rotors
+ 
+# Gravity in body frame
+F_gravity_inB = R_inW_ofB.T @ sym.Matrix([0, 0, -m * g])
+ 
+# Total force in body frame
+f_inB = F_gravity_inB + F_rotors_inB
+ 
+ 
+def T_Pi_ownframe(w_i):
+    return sym.Matrix([0, 0, k_f * w_i])
+ 
+ 
+T_P1_inB = R_B_P1 @ T_Pi_ownframe(w_1)
+T_P2_inB = R_B_P2 @ T_Pi_ownframe(w_2)
+T_P3_inB = R_B_P3 @ T_Pi_ownframe(w_3)
+T_P4_inB = R_B_P4 @ T_Pi_ownframe(w_4)
+ 
+# Sanity check: both ways of computing rotor force must agree
+F_rotors_check = T_P1_inB + T_P2_inB + T_P3_inB + T_P4_inB
+assert sym.simplify(F_rotors_check - F_rotors_inB) == sym.zeros(3, 1)
+ 
+# Torque from thrust lever arms
+Tau_arm = (O_P1.cross(T_P1_inB) + O_P2.cross(T_P2_inB)
+           + O_P3.cross(T_P3_inB) + O_P4.cross(T_P4_inB))
+Tau_arm = sym.simplify(Tau_arm)
+Tau_arm_matrix = sym.simplify(Tau_arm.jacobian([w_1, w_2, w_3, w_4]))
+ 
+ 
+def tau_ext_ownframe(w_i):
+    return sym.Matrix([0, 0, -k_m * w_i])
+ 
+ 
+# Rotor reaction torques (propeller gyroscopic terms neglected).
+# SPIN_DIR[i] sets the sign of each rotor's drag torque (CW vs CCW).
+Tau_reaction = (
+    SPIN_DIR[0] * (R_B_P1 @ (-tau_ext_ownframe(w_1)))
+    + SPIN_DIR[1] * (R_B_P2 @ (-tau_ext_ownframe(w_2)))
+    + SPIN_DIR[2] * (R_B_P3 @ (-tau_ext_ownframe(w_3)))
+    + SPIN_DIR[3] * (R_B_P4 @ (-tau_ext_ownframe(w_4)))
+)
+Tau_reaction_matrix = sym.simplify(Tau_reaction.jacobian([w_1, w_2, w_3, w_4]))
+ 
+tau_inB = (Tau_arm_matrix + Tau_reaction_matrix) @ w_rotors
+ 
+alpha_vec = sym.Matrix([alpha_1, alpha_2, alpha_3, alpha_4])
+w_alpha_vec = sym.Matrix([w_alpha_1, w_alpha_2, w_alpha_3, w_alpha_4])
+ 
+# Full 16-state dynamics.
+# State order: [p(3), (psi, theta, phi)(3), v_body(3), w_body(3), alpha(4)]
+f_sym = sym.Matrix.vstack(
+    R_inW_ofB @ v_inB_ofWB,
+    N @ w_inB_ofWB,
+    (1 / m) * (f_inB - w_inB_ofWB.cross(m * v_inB_ofWB)),
+    J_inB.inv() @ (tau_inB - w_inB_ofWB.cross(J_inB @ w_inB_ofWB)),
+    w_alpha_vec,
+)
+ 
+ 
+# ============================================================
+# LAMBDIFY -> FAST NUMERIC FUNCTION
+# ============================================================
+ 
+state_syms = [p_x, p_y, p_z, psi, theta, phi,
+              v_x, v_y, v_z, w_x, w_y, w_z,
+              alpha_1, alpha_2, alpha_3, alpha_4]
+ 
+input_syms = [w_1, w_2, w_3, w_4,
+              w_alpha_1, w_alpha_2, w_alpha_3, w_alpha_4]
+ 
+param_subs = {sym.Symbol(k): v for k, v in params.items()}
+ 
+_f_num = sym.lambdify((state_syms, input_syms),
+                      f_sym.subs(param_subs),
+                      modules="numpy", cse=True)
+ 
+ 
+def tiltrotor_dynamics(t, state, u):
+    """
+    16-state tilt-rotor dynamics.
+ 
+    state = [x, y, z, psi, theta, phi, vx_b, vy_b, vz_b, wx, wy, wz, a1, a2, a3, a4]
+    u     = [w1, w2, w3, w4, w_alpha1, w_alpha2, w_alpha3, w_alpha4]
+    """
+    return np.asarray(_f_num(state, u), dtype=float).ravel()
+ 
+ 
+# ============================================================
+# INPUTS  
+# ============================================================
+
+hover_w = params["m"] * params["g"] / (4 * params["k_f"])   # signed-square speed at hover
+
+# USER INPUT: tilt angle of each rotor in degrees [alpha1, alpha2, alpha3, alpha4]
+TILT_DEG = [50, 0.0, -50, 0] #translate
+#TILT_DEG = [50, 0.0, 0, 0] #tumble
+#TILT_DEG = [50, 0.0, 50, 0] #hover
+
+
+
+
+def set_w(t, state):
+    #return np.hstack((hover_w * np.ones(4), np.zeros(4)))
+    #return np.hstack(( np.zeros(8)))  # hover, no tilt motion
+    w = np.array([hover_w/np.cos(np.deg2rad(TILT_DEG[0])), hover_w, hover_w/np.cos(np.deg2rad(TILT_DEG[0])), hover_w])  # hover, no tilt motion
+    return np.hstack((w, np.zeros(4)))
+
+# ============================================================
+# SIMULATION =
+# ============================================================
+ 
+if __name__ == "__main__":
+
+    x0 = np.zeros(16)
+    x0[2] = 5.0                          # start at z = 5 m
+    x0[12:16] = np.deg2rad(TILT_DEG)     # tilt angles from the user input
+    
+ 
+    # Sanity check: at hover the accelerations should be ~zero
+    xdot0 = tiltrotor_dynamics(0.0, x0, set_w(0.0, x0))
+    print(xdot0[6:12])
+    print(f"Hover signed-square speed = {hover_w:.1f}  (omega = {np.sqrt(hover_w):.1f} rad/s)")
+    print(f"Max |xdot| at hover = {np.max(np.abs(xdot0[6:12])):.2e}  (should be ~0)")
+ 
+    t_start, t_final, dt_plot = 0.0, 3.0, 0.01
+    t_eval = np.arange(t_start, t_final + dt_plot, dt_plot)
+ 
+    solution = solve_ivp(
+        fun=lambda t, x: tiltrotor_dynamics(t, x, set_w(t, x)),
+        t_span=(t_start, t_final),
+        y0=x0,
+        t_eval=t_eval,
+        method="RK45",
+        rtol=1e-9,
+        atol=1e-11,
+    )
+ 
+    if not solution.success:
+        raise RuntimeError(solution.message)
+ 
+    t = solution.t
+    X = solution.y
+ 
+    x, y, z = X[0], X[1], X[2]
+    psi_, theta_, phi_ = X[3], X[4], X[5]          # yaw, pitch, roll
+    vB = X[6:9]
+    wB = X[9:12]
+    alphas = X[12:16]
+ 
+    # Body-frame velocity -> world-frame velocity (for plotting)
+    vW = np.zeros_like(vB)
+    for i in range(len(t)):
+        cp, sp = np.cos(psi_[i]), np.sin(psi_[i])
+        ct, st = np.cos(theta_[i]), np.sin(theta_[i])
+        cf, sf = np.cos(phi_[i]), np.sin(phi_[i])
+        R = np.array([
+            [ct*cp, sf*st*cp - cf*sp, cf*st*cp + sf*sp],
+            [ct*sp, sf*st*sp + cf*cp, cf*st*sp - sf*cp],
+            [-st,   sf*ct,            cf*ct],
+        ])
+        vW[:, i] = R @ vB[:, i]
+ 
+    print("\n======================================")
+    print("FINAL STATE")
+    print("======================================")
+    print(f"Position [m]:   x={x[-1]:.4f}, y={y[-1]:.4f}, z={z[-1]:.4f}")
+    print(f"Velocity W [m/s]: vx={vW[0,-1]:.4f}, vy={vW[1,-1]:.4f}, vz={vW[2,-1]:.4f}")
+    print(f"Attitude [deg]: roll={np.rad2deg(phi_[-1]):.3f}, "
+          f"pitch={np.rad2deg(theta_[-1]):.3f}, yaw={np.rad2deg(psi_[-1]):.3f}")
+    print(f"Tilt [deg]:     {np.rad2deg(alphas[:, -1]).round(2)}")
+ 
+    # ---------------- PLOTS ----------------
+    fig = plt.figure(figsize=(9, 7))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.plot(x, y, z, linewidth=2)
+    ax.scatter(x[0], y[0], z[0], s=80, label="Start")
+    ax.scatter(x[-1], y[-1], z[-1], s=80, label="End")
+    ax.set_xlabel("X [m]"); ax.set_ylabel("Y [m]"); ax.set_zlabel("Z [m]")
+    ax.set_title("Tilt-Rotor 3D Trajectory")
+    ax.legend()
+    plt.tight_layout()
+ 
+    def line_plot(ys, labels, ylabel, title):
+        plt.figure(figsize=(10, 6))
+        for yv, lab in zip(ys, labels):
+            plt.plot(t, yv, label=lab)
+        plt.xlabel("Time [s]"); plt.ylabel(ylabel); plt.title(title)
+        plt.grid(True); plt.legend(); plt.tight_layout()
+ 
+    line_plot([x, y, z], ["x", "y", "z"], "Position [m]", "Position vs Time")
+    line_plot(vW, [r"$v_x$", r"$v_y$", r"$v_z$"], "Velocity [m/s]", "World-Frame Velocity")
+    line_plot([np.rad2deg(phi_), np.rad2deg(theta_), np.rad2deg(psi_)],
+              ["Roll", "Pitch", "Yaw"], "Angle [deg]", "Drone Attitude")
+    line_plot(np.rad2deg(wB), ["p", "q", "r"], "Angular Rate [deg/s]", "Body Angular Rates")
+    line_plot(np.rad2deg(alphas), [rf"$\alpha_{i+1}$" for i in range(4)],
+              "Tilt Angle [deg]", "Rotor Tilt Angles")
+
+from matplotlib.animation import FuncAnimation
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+L_ARM      = params["L"]
+R_ROTOR    = 0.08      # rotor disc radius [m]
+THRUST_LEN = 0.12      # length of the thrust arrow [m]
+TILT_EXAG  = 1.0       # >1 exaggerates tilt visually (display only)
+
+
+def Rz_n(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+
+def Rx_n(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+
+
+def euler_to_R(psi, theta, phi):
+    """Body -> world, R = Rz Ry Rx (same as the model)."""
+    cp, sp = np.cos(psi), np.sin(psi)
+    ct, st = np.cos(theta), np.sin(theta)
+    cf, sf = np.cos(phi), np.sin(phi)
+    return np.array([
+        [ct*cp, sf*st*cp - cf*sp, cf*st*cp + sf*sp],
+        [ct*sp, sf*st*sp + cf*cp, cf*st*sp - sf*cp],
+        [-st,   sf*ct,            cf*ct],
+    ])
+
+
+# Rotor mounting angles and positions in the body frame (rotor 1 on +x)
+rotor_angles = np.deg2rad([0, 90, 180, 270])
+rotor_pos_B = np.array([[L_ARM*np.cos(a), L_ARM*np.sin(a), 0.0] for a in rotor_angles])
+
+# Unit-ish circle in the propeller's own x-y plane (its normal is the thrust axis)
+ring = np.linspace(0, 2*np.pi, 40)
+disc_local = np.stack([R_ROTOR*np.cos(ring), R_ROTOR*np.sin(ring), np.zeros_like(ring)], axis=1)
+
+
+def pose(i):
+    """World-frame geometry at sample i: discs, thrust arrows, the two arms."""
+    R = euler_to_R(psi_[i], theta_[i], phi_[i])
+    p = np.array([x[i], y[i], z[i]])
+    discs, thrusts = [], []
+    for k in range(4):
+        Rp = Rz_n(rotor_angles[k]) @ Rx_n(TILT_EXAG * alphas[k, i])   # = R_B_Pk
+        c_B = rotor_pos_B[k]
+        disc_B = c_B + disc_local @ Rp.T
+        thr_B = np.vstack([c_B, c_B + THRUST_LEN * Rp[:, 2]])
+        discs.append(disc_B @ R.T + p)
+        thrusts.append(thr_B @ R.T + p)
+    arms = [rotor_pos_B[[0, 2]] @ R.T + p, rotor_pos_B[[1, 3]] @ R.T + p]
+    return discs, thrusts, arms
+
+
+fig_anim = plt.figure(figsize=(9, 7))
+axa = fig_anim.add_subplot(111, projection="3d")
+
+rotor_colors = ["tab:red", "tab:blue", "tab:blue", "tab:blue"]   # rotor 1 (front) in red
+discs0, thrusts0, arms0 = pose(0)
+
+disc_coll = Poly3DCollection(discs0, facecolors=rotor_colors, edgecolors="k", alpha=0.5)
+axa.add_collection3d(disc_coll)
+arm_lines = [axa.plot(a[:, 0], a[:, 1], a[:, 2], "k-", linewidth=3)[0] for a in arms0]
+thrust_lines = [axa.plot(t_[:, 0], t_[:, 1], t_[:, 2], color="tab:green", linewidth=2)[0]
+                for t_ in thrusts0]
+trail, = axa.plot([], [], [], "k--", linewidth=1)
+
+VIEW_HALF = 0.8   # half-width of the view window around the drone [m]; smaller = more zoomed in
+
+axa.set_box_aspect((1, 1, 1))
+axa.set_xlabel("X [m]"); axa.set_ylabel("Y [m]"); axa.set_zlabel("Z [m]")
+title = axa.set_title("t = 0.00 s")
+
+
+def set_view(i):
+    c = np.array([x[i], y[i], z[i]])
+    axa.set_xlim(c[0] - VIEW_HALF, c[0] + VIEW_HALF)
+    axa.set_ylim(c[1] - VIEW_HALF, c[1] + VIEW_HALF)
+    axa.set_zlim(c[2] - VIEW_HALF, c[2] + VIEW_HALF)
+
+
+set_view(0)
+
+step = 2
+frames = range(0, len(t), step)
+
+
+def update(i):
+    set_view(i)
+    discs, thrusts, arms = pose(i)
+    disc_coll.set_verts(discs)
+    for ln, a in zip(arm_lines, arms):
+        ln.set_data(a[:, 0], a[:, 1]); ln.set_3d_properties(a[:, 2])
+    for ln, t_ in zip(thrust_lines, thrusts):
+        ln.set_data(t_[:, 0], t_[:, 1]); ln.set_3d_properties(t_[:, 2])
+    trail.set_data(x[:i+1], y[:i+1]); trail.set_3d_properties(z[:i+1])
+    title.set_text(f"t = {t[i]:.2f} s")
+    return [disc_coll, *arm_lines, *thrust_lines, trail, title]
+
+
+anim = FuncAnimation(fig_anim, update, frames=frames, interval=20, blit=False)
+# anim.save("tiltrotor.gif", fps=50)   # optional, needs pillow
+plt.show()
